@@ -65,11 +65,9 @@ st.subheader("Currency Pair Selection")
 
 all_pair_keys = list(verified_pairs.keys())
 
-# Initialise session state
 if "selected_pairs" not in st.session_state:
     st.session_state.selected_pairs = ["EURUSD"] if "EURUSD" in verified_pairs else all_pair_keys[:1]
 
-# "Select All" button — sets session state then reruns
 if st.button("★ Select All Default Currencies"):
     st.session_state.selected_pairs = all_pair_keys
     st.rerun()
@@ -81,7 +79,6 @@ selected_pairs = st.multiselect(
     key="pair_multiselect",
 )
 
-# Keep session state in sync with manual changes
 st.session_state.selected_pairs = selected_pairs
 
 custom_input = st.text_input(
@@ -89,7 +86,6 @@ custom_input = st.text_input(
     value="",
 ).strip().upper()
 
-# Validate custom pairs
 custom_pairs = {}
 if custom_input:
     for raw in custom_input.split(","):
@@ -102,7 +98,6 @@ if custom_input:
             else:
                 st.error(f"Could not resolve '{p}' — check the pair name.")
 
-# Merge
 all_selected = {p: verified_pairs[p] for p in selected_pairs}
 all_selected.update(custom_pairs)
 
@@ -136,11 +131,32 @@ with col2:
 
 col3, col4 = st.columns(2)
 with col3:
-    start_time_input = st.time_input("Start Time (GMT)", time(7, 0))
+    start_time_input = st.time_input("Start Time (GMT)", time(7, 30))
 with col4:
-    end_time_input = st.time_input("End Time (GMT)", time(13, 0))
+    end_time_input = st.time_input("End Time (GMT)", time(12, 0))
+
+# ------------------------------------------------------------------
+# UI — Optional Columns Toggle
+# ------------------------------------------------------------------
+st.subheader("Display Settings")
+
+OPTIONAL_COLS = ["High Time (UTC)", "Low Time (UTC)", "Range (pips)"]
+
+visible_optional_cols = st.multiselect(
+    "Optional columns to show (uncheck to hide)",
+    options=OPTIONAL_COLS,
+    default=OPTIONAL_COLS,
+    help="Choose which optional columns to display in the per-pair tables and summaries.",
+)
 
 run = st.button("Fetch Data")
+
+# ------------------------------------------------------------------
+# Helper: filter optional columns from a daily_df
+# ------------------------------------------------------------------
+def filter_optional_cols(df: pd.DataFrame) -> pd.DataFrame:
+    cols_to_drop = [c for c in OPTIONAL_COLS if c not in visible_optional_cols and c in df.columns]
+    return df.drop(columns=cols_to_drop)
 
 # ------------------------------------------------------------------
 # Helper: invert OHLC for reversed parity
@@ -168,7 +184,6 @@ def fetch_pair_daily(pair_name, instrument, start, end, s_time, e_time, reverse)
     if df.empty:
         return None, None, "No data returned from Dukascopy."
 
-    # Normalise time column
     if df.index.name and df.index.name.lower() in ("time", "timestamp", "date"):
         df = df.reset_index()
     for col in df.columns:
@@ -181,7 +196,6 @@ def fetch_pair_daily(pair_name, instrument, start, end, s_time, e_time, reverse)
     if df["time"].dt.tz is not None:
         df["time"] = df["time"].dt.tz_convert(None)
 
-    # Resample to 30-min bars
     df = df.set_index("time")
     agg_dict = {"open": "first", "high": "max", "low": "min", "close": "last"}
     if "volume" in df.columns:
@@ -193,7 +207,6 @@ def fetch_pair_daily(pair_name, instrument, start, end, s_time, e_time, reverse)
         .reset_index()
     )
 
-    # Filter to session window
     def to_sec(t):
         return t.hour * 3600 + t.minute * 60 + t.second
 
@@ -209,14 +222,12 @@ def fetch_pair_daily(pair_name, instrument, start, end, s_time, e_time, reverse)
     if df_30.empty:
         return None, None, "No data in selected session window."
 
-    # Apply inversion if requested
     if reverse:
         df_30 = invert_ohlc(df_30)
 
     display_name = (pair_name[3:] + pair_name[:3]) if reverse else pair_name
     pip_mult     = 100 if "JPY" in display_name.upper() else 10000
 
-    # One row per calendar day
     df_30["date"] = df_30["time"].dt.date
     daily_rows = []
     for day, grp in df_30.groupby("date"):
@@ -245,8 +256,8 @@ if run:
 
     st.write(f"Fetching data for: **{', '.join(all_selected.keys())}** …")
 
-    all_daily_dfs  = {}   # pair_name → daily_df  (used for date-wise summary)
-    display_names  = {}   # pair_name → display_name
+    all_daily_dfs  = {}
+    display_names  = {}
 
     # ----------------------------------------------------------------
     # Per-currency sections — daily high/low table + download
@@ -269,19 +280,18 @@ if run:
                 label = f"🔹 {display_name}" + (" *(reversed)*" if reverse else "")
                 st.subheader(label)
 
-                # Daily high/low breakdown
-                st.dataframe(daily_df, use_container_width=True)
+                display_df = filter_optional_cols(daily_df)
+                st.dataframe(display_df, use_container_width=True)
 
-                # Per-pair CSV download
                 st.download_button(
                     label=f"⬇️ Download {display_name} CSV",
-                    data=daily_df.to_csv(index=False).encode(),
+                    data=display_df.to_csv(index=False).encode(),
                     file_name=f"{display_name}_daily_{start_date}_to_{end_date}.csv",
                     mime="text/csv",
                     key=f"dl_{pair_name}",
                 )
 
-                all_daily_dfs[pair_name] = daily_df
+                all_daily_dfs[pair_name] = daily_df   # store full df for summaries
                 display_names[pair_name] = display_name
 
             except Exception as e:
@@ -289,13 +299,14 @@ if run:
                 st.exception(e)
 
     # ----------------------------------------------------------------
-    # Date-wise cross-currency summary
+    # Currency-wise summary pivot table
+    # Rows = currencies, Columns = dates (each date: High | Low)
     # ----------------------------------------------------------------
-    if len(all_daily_dfs) > 1:
+    if all_daily_dfs:
         st.markdown("---")
-        st.subheader("📅 Date-wise Summary — All Currencies")
+        st.subheader("🔹 Currency-wise Summary — All Selected Pairs")
 
-        # Collect all dates that appear across any pair
+        # Collect all dates across all pairs (sorted)
         all_dates = sorted(
             set(
                 date
@@ -304,29 +315,45 @@ if run:
             )
         )
 
-        date_rows = []
+        # Build MultiIndex columns: (date, "High") and (date, "Low")
+        col_tuples = []
         for date in all_dates:
-            row = {"Date": date}
-            for pair_name, daily_df in all_daily_dfs.items():
-                dname = display_names[pair_name]
-                match = daily_df[daily_df["Date"] == date]
-                if not match.empty:
-                    row[f"{dname} High"]       = match.iloc[0]["Session High"]
-                    row[f"{dname} Low"]        = match.iloc[0]["Session Low"]
-                    row[f"{dname} Range(pips)"] = match.iloc[0]["Range (pips)"]
-                else:
-                    row[f"{dname} High"]       = "-"
-                    row[f"{dname} Low"]        = "-"
-                    row[f"{dname} Range(pips)"] = "-"
-            date_rows.append(row)
+            col_tuples.append((date, "High"))
+            col_tuples.append((date, "Low"))
+        multi_cols = pd.MultiIndex.from_tuples(col_tuples)
 
-        date_summary_df = pd.DataFrame(date_rows)
-        st.dataframe(date_summary_df, use_container_width=True)
+        pivot_rows = []
+        for pair_name, daily_df in all_daily_dfs.items():
+            dname = display_names[pair_name]
+            date_map = {
+                row["Date"]: row
+                for _, row in daily_df.iterrows()
+            }
+            row_data = {"Currency": dname}
+            for date in all_dates:
+                if date in date_map:
+                    row_data[(date, "High")] = date_map[date]["Session High"]
+                    row_data[(date, "Low")]  = date_map[date]["Session Low"]
+                else:
+                    row_data[(date, "High")] = "-"
+                    row_data[(date, "Low")]  = "-"
+            pivot_rows.append(row_data)
+
+        pivot_df = pd.DataFrame(pivot_rows)
+        pivot_df = pivot_df.set_index("Currency")
+        pivot_df.columns = pd.MultiIndex.from_tuples(pivot_df.columns)
+
+        st.dataframe(pivot_df, use_container_width=True)
+
+        # Flatten columns for CSV export
+        flat_df = pivot_df.copy()
+        flat_df.columns = [f"{d} {h}" for d, h in flat_df.columns]
+        flat_df = flat_df.reset_index()
 
         st.download_button(
-            label="⬇️ Download Date-wise Summary CSV",
-            data=date_summary_df.to_csv(index=False).encode(),
-            file_name=f"datewise_summary_{start_date}_to_{end_date}.csv",
+            label="⬇️ Download Currency-wise Summary CSV",
+            data=flat_df.to_csv(index=False).encode(),
+            file_name=f"currency_summary_{start_date}_to_{end_date}.csv",
             mime="text/csv",
-            key="dl_datewise",
+            key="dl_currency_summary",
         )
